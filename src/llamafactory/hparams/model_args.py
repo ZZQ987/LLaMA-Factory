@@ -346,6 +346,14 @@ class ProcessorArguments:
         default=16 * 16,
         metadata={"help": "The minimum number of pixels of video inputs."},
     )
+    min_token_number: int = field(
+        default=1024,
+        metadata={"help": "The minimum number of tokens for video inputs."},
+    )
+    max_token_number: int = field(
+        default=16384,
+        metadata={"help": "The maximum number of tokens for video inputs."},
+    )
     video_fps: float = field(
         default=2.0,
         metadata={"help": "The frames to sample per second for video inputs."},
