@@ -97,6 +97,8 @@ def patch_processor(
     setattr(processor, "video_maxlen", model_args.video_maxlen)
     setattr(processor, "use_audio_in_video", model_args.use_audio_in_video)
     setattr(processor, "audio_sampling_rate", model_args.audio_sampling_rate)
+    setattr(processor, "max_token_number", model_args.max_token_number)
+    setattr(processor, "min_token_number", model_args.min_token_number)
 
 
 def patch_config(

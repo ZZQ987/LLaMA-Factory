@@ -45,6 +45,8 @@ if is_ray_available():
 if TYPE_CHECKING:
     from transformers import TrainerCallback
 
+# import multiprocessing as mp 
+# mp.set_start_method("spawn", force=True)
 
 logger = logging.get_logger(__name__)
 
@@ -103,8 +105,15 @@ def _training_function(config: dict[str, Any]) -> None:
     else:
         raise ValueError(f"Unknown task: {finetuning_args.stage}.")
 
-    if is_ray_available() and ray.is_initialized():
-        return  # if ray is intialized it will destroy the process group on return
+    if is_ray_available():
+        try:
+            # Ensure ray is imported (in case module-level import was skipped)
+            if 'ray' not in globals():
+                import ray
+            if ray.is_initialized():
+                return  # if ray is intialized it will destroy the process group on return
+        except (ImportError, NameError):
+            pass
 
     try:
         if dist.is_initialized():

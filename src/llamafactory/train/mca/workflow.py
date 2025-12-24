@@ -52,6 +52,9 @@ if TYPE_CHECKING:
 
     from ...hparams import DataArguments, FinetuningArguments, ModelArguments
 
+# import multiprocessing as mp 
+# mp.set_start_method("spawn", force=True)
+
 
 logger = get_logger(__name__)
 

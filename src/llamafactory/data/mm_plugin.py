@@ -18,9 +18,12 @@
 import inspect
 import math
 import os
+import pickle
 import re
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime
+from functools import lru_cache
 from io import BytesIO
 from typing import TYPE_CHECKING, BinaryIO, Literal, Optional, TypedDict, Union
 
@@ -41,6 +44,13 @@ from ..extras.packages import (
     is_transformers_version_greater_than,
 )
 
+# import av
+
+# av.logging.set_level(av.logging.ERROR)
+
+# for i in range(1000):
+#     av.error.ErrorType._create(f"ERRORTYPE_{i}", i)
+
 
 if is_librosa_available():
     import librosa
@@ -53,6 +63,13 @@ if is_pillow_available():
 
 if is_pyav_available():
     import av
+
+try:
+    import decord
+    from decord import VideoReader, cpu
+    is_decord_available = True
+except ImportError:
+    is_decord_available = False
 
 
 if is_transformers_version_greater_than("4.52.0"):
@@ -75,7 +92,7 @@ if TYPE_CHECKING:
         bytes: Optional[bytes]
 
     ImageInput = Union[str, bytes, EncodedImage, BinaryIO, ImageObject]
-    VideoInput = Union[str, BinaryIO, list[list[ImageInput]]]
+    VideoInput = Union[str, BinaryIO, list[list[ImageInput]], dict] # 我们使用dict，其中包括路径和crop区间
     AudioInput = Union[str, BinaryIO, NDArray]
 
     class RegularizedImageOutput(TypedDict):
@@ -230,6 +247,12 @@ class MMPluginMixin:
         self, image: "ImageObject", image_max_pixels: int, image_min_pixels: int, **kwargs
     ) -> "ImageObject":
         r"""Pre-process a single image."""
+        assert image_max_pixels <= 768*28*28, "image_max_pixels should be less than 768*28*28"
+
+        # print(f"image_max_pixels: {image_max_pixels}")
+        # print(f"(resize 前)image.width * image.height: {image.width * image.height}")
+        # print(f"(resize 前)image.size: {image.size}")
+
         if (image.width * image.height) > image_max_pixels:
             resize_factor = math.sqrt(image_max_pixels / (image.width * image.height))
             width, height = int(image.width * resize_factor), int(image.height * resize_factor)
@@ -242,6 +265,9 @@ class MMPluginMixin:
 
         if image.mode != "RGB":
             image = image.convert("RGB")
+
+        # print(f"(resize 后)image.size: {image.size}")
+        # print(f"(resize 后)image.width * image.height: {image.width * image.height}")
 
         return image
 
@@ -257,10 +283,51 @@ class MMPluginMixin:
         sample_frames = min(total_frames, video_maxlen, sample_frames)
         return np.linspace(0, total_frames - 1, sample_frames).astype(np.int32)
 
+    # @lru_cache(maxsize=1)
+    def print_video_info(self, video_len,max_token_number,max_token_number_per_frame,image_max_pixels):
+        print('***************************************************')
+        print(f"video_len: {video_len}")
+        print(f"max_token_number: {max_token_number}")
+        print(f"max_token_number_per_frame: {max_token_number_per_frame}")
+        print(f"image_max_pixels: {image_max_pixels}")
+        print('***************************************************')
+
+
     def _regularize_images(self, images: list["ImageInput"], **kwargs) -> "RegularizedImageOutput":
         r"""Regularize images to avoid error. Including reading and pre-processing."""
+
         results = []
-        for image in images:
+        max_token_number = kwargs.get("max_token_number", None)
+        min_token_number = kwargs.get("min_token_number", None)
+        idx_video = kwargs.get("idx_video", None)
+        num_video = kwargs.get("num_video", None)
+
+        if idx_video is not None and idx_video > 0:
+            max_token_number = max_token_number // (num_video-1)
+            min_token_number = min_token_number // (num_video-1)
+            # print(f"[INFO]max_token_number: {max_token_number}, min_token_number: {min_token_number}, idx_video: {idx_video}")
+
+        video_len = len(images)
+
+        if video_len > 0 and (max_token_number is not None or min_token_number is not None):
+            # self.print_video_info(max_token_number, max_token_number_per_frame)
+            max_token_number_per_frame = int(max_token_number // (video_len//2))
+            # print(f"max_token_number_per_frame: {max_token_number_per_frame}")
+            kwargs["image_max_pixels"] = min(max_token_number_per_frame,768) * 28 * 28   # 28*28 is the scale factor of the image    
+            # self.print_video_info(video_len,max_token_number, max_token_number_per_frame,kwargs["image_max_pixels"])
+            # kwargs["image_max_pixels"] = 100
+
+            min_token_number_per_frame = int(min_token_number // (video_len//2))
+            # print(f"min_token_number_per_frame: {min_token_number_per_frame}")
+            kwargs["image_min_pixels"] = min(max(min_token_number_per_frame,32),kwargs["image_max_pixels"]) * 28 * 28
+
+            if kwargs["image_min_pixels"] > kwargs["image_max_pixels"]:
+                # 保险起见，如果最小像素大于最大像素，则设置为最大像素
+                kwargs["image_min_pixels"] = kwargs["image_max_pixels"]
+                
+        first_image_size = None
+        _resize_image = False
+        for idx, image in enumerate(images):
             if isinstance(image, (str, BinaryIO)):
                 image = Image.open(image)
             elif isinstance(image, bytes):
@@ -270,6 +337,16 @@ class MMPluginMixin:
                     image = Image.open(BytesIO(image["bytes"]))
                 else:
                     image = Image.open(image["path"])
+
+            if idx == 0:
+                first_image_size = image.size
+            else:
+                if image.size != first_image_size:
+                    image = image.resize(first_image_size)
+                    if _resize_image == False:
+                        print(f"[INFO]image.size != first_image_size, resize image, video_path: {kwargs['video_path']}")
+                        _resize_image = True
+
 
             if not isinstance(image, ImageObject):
                 raise ValueError(f"Expect input is a list of images, but got {type(image)}.")
@@ -291,18 +368,33 @@ class MMPluginMixin:
                 frames = video
                 durations.append(len(frames) / kwargs.get("video_fps", 2.0))
             else:
-                container = av.open(video, "r")
-                video_stream = next(stream for stream in container.streams if stream.type == "video")
-                sample_indices = self._get_video_sample_indices(video_stream, **kwargs)
-                container.seek(0)
-                for frame_idx, frame in enumerate(container.decode(video_stream)):
-                    if frame_idx in sample_indices:
-                        frames.append(frame.to_image())
+                container = None
+                try:
+                    container = av.open(video, "r")
+                    video_stream = next(stream for stream in container.streams if stream.type == "video")
+                    sample_indices = self._get_video_sample_indices(video_stream, **kwargs)
+                    container.seek(0)
+                    for frame_idx, frame in enumerate(container.decode(video_stream)):
+                        if frame_idx in sample_indices:
+                            frames.append(frame.to_image())
 
-                if video_stream.duration is None:
-                    durations.append(len(frames) / kwargs.get("video_fps", 2.0))
-                else:
-                    durations.append(float(video_stream.duration * video_stream.time_base))
+                    if video_stream.duration is None:
+                        durations.append(len(frames) / kwargs.get("video_fps", 2.0))
+                    else:
+                        durations.append(float(video_stream.duration * video_stream.time_base))
+                except Exception as e:
+                    # Catch all exceptions to avoid PyAV error objects being pickled in multiprocessing
+                    # Log error message as string instead of exception object
+                    error_msg = str(e) if e else "Unknown video decoding error"
+                    # Skip corrupted videos, return empty frames
+                    frames = []
+                    durations.append(0.0)
+                finally:
+                    if container is not None:
+                        try:
+                            container.close()
+                        except Exception:
+                            pass
 
             frames = self._regularize_images(frames, **kwargs)["images"]
             results.append(frames)
@@ -384,6 +476,8 @@ class MMPluginMixin:
                 image_min_pixels=getattr(processor, "video_min_pixels", 16 * 16),
                 video_fps=getattr(processor, "video_fps", 2.0),
                 video_maxlen=getattr(processor, "video_maxlen", 128),
+                max_token_number=getattr(processor, "max_token_number", None),
+                min_token_number=getattr(processor, "min_token_number", None),
             )["videos"]
             if "videos" in inspect.signature(video_processor.preprocess).parameters:  # for qwen2_vl and video_llava
                 mm_inputs.update(video_processor(images=None, videos=videos, return_tensors="pt"))
@@ -630,6 +724,8 @@ class InternVLPlugin(BasePlugin):
                 image_min_pixels=getattr(processor, "video_min_pixels", 16 * 16),
                 video_fps=getattr(processor, "video_fps", 2.0),
                 video_maxlen=getattr(processor, "video_maxlen", 128),
+                max_token_number=getattr(processor, "max_token_number", None),
+                min_token_number=getattr(processor, "min_token_number", None),
             )["videos"]
 
         if len(images) != 0:
@@ -1012,6 +1108,8 @@ class MiniCPMVPlugin(BasePlugin):
                 image_min_pixels=getattr(processor, "video_min_pixels", 16 * 16),
                 video_fps=getattr(processor, "video_fps", 2.0),
                 video_maxlen=getattr(processor, "video_maxlen", 128),
+                max_token_number=getattr(processor, "max_token_number", None),
+                min_token_number=getattr(processor, "min_token_number", None),
             )["videos"]
             video_inputs = image_processor(videos, do_pad=True, max_slice_nums=2, return_tensors="pt")
             mm_inputs.update(video_inputs)
@@ -1469,37 +1567,257 @@ class Qwen2VLPlugin(BasePlugin):
 
         return image
 
+    def _get_raw_fps(self, video_stream: "Stream") -> float:
+        if hasattr(video_stream, "average_rate") and video_stream.average_rate is not None:
+            return float(video_stream.average_rate)
+        elif hasattr(video_stream, "frames") and hasattr(video_stream, "duration") and hasattr(video_stream, "time_base"):
+            if video_stream.duration is not None and video_stream.duration > 0 and video_stream.time_base is not None:
+                return float(video_stream.frames) / float(video_stream.duration * video_stream.time_base)
+        elif hasattr(video_stream, "base_rate") and video_stream.base_rate is not None:
+            return float(video_stream.base_rate)
+        elif hasattr(video_stream, "guessed_rate") and video_stream.guessed_rate is not None:
+            return float(video_stream.guessed_rate)
+        return None
+
+    @override
+    def _get_video_sample_indices(
+        self, video_stream: "Stream", video_fps: float, video_maxlen: int, crop_interval: Optional[list[float]] = None, **kwargs
+    ) -> list[int]:
+        r"""Compute video sample indices according to fps."""
+
+        total_frames = video_stream.frames
+        if total_frames == 0 and crop_interval is None:  # infinite video
+            return np.linspace(0, video_maxlen - 1, video_maxlen).astype(np.int32)
+
+        raw_fps = self._get_raw_fps(video_stream)
+
+        if raw_fps is None:
+            raise ValueError("raw_fps is None")
+
+
+        # 先确定裁剪区间
+        if crop_interval is not None:
+            start_frame = max(0, int(crop_interval[0] * raw_fps))
+            end_frame = min(total_frames - 1, int(crop_interval[1] * raw_fps))
+            # 基于裁剪后的区间计算采样帧数
+            crop_duration = crop_interval[1] - crop_interval[0]
+            sample_frames = max(1, math.floor(crop_duration * video_fps))
+
+        else:
+            start_frame = 0
+            end_frame = total_frames - 1
+            # 基于整个视频计算采样帧数
+            sample_frames = max(1, math.floor(float(video_stream.duration * video_stream.time_base) * video_fps))
+        
+        # 限制采样帧数
+        available_frames = end_frame - start_frame + 1
+        sample_frames = min(available_frames, video_maxlen, sample_frames)
+
+        return np.linspace(start_frame, end_frame, sample_frames).astype(np.int32)
+
     @override
     def _regularize_videos(self, videos: list["VideoInput"], **kwargs) -> "RegularizedVideoOutput":
+
+        try:
+            video_result = self._regularize_videos_av(videos, **kwargs)
+            return video_result
+        except Exception as e:
+            print(f"[ERROR] Failed to parse video with av: {videos}")
+            print(f"[ERROR] Error message: {e}")
+            try:
+                video_result = self._regularize_videos_decord(videos, **kwargs)
+                print(f"[INFO] Retry success [av->decord] for video: {videos}")
+                return video_result
+            except Exception as e:
+                print(f"[ERROR] Failed to parse video with decord: {videos}")
+                print(f"[ERROR] Error message: {e}")
+                raise e
+
+    
+    @override
+    def _regularize_videos_av(self, videos: list["VideoInput"], **kwargs) -> "RegularizedVideoOutput":
         results, fps_per_video, durations = [], [], []
-        for video in videos:
+        for idx_video, _video in enumerate(videos):
+
+            if isinstance(_video, dict):
+                video = _video["url"]
+                crop_interval = _video.get("crop", None) if idx_video>0 else None
+                if crop_interval is not None and crop_interval[0] == -1.0 and crop_interval[1] == -1.0:
+                    crop_interval = None
+                
+            else:
+                video = _video
+                crop_interval = None
+
+            kwargs['idx_video'] = idx_video
+            kwargs['video_path'] = video
+            kwargs['num_video'] = len(videos)
             frames: list[ImageObject] = []
+
             if _check_video_is_nested_images(video):
                 for frame in video:
                     if not is_valid_image(frame) and not isinstance(frame, dict) and not os.path.exists(frame):
-                        raise ValueError("Invalid image found in video frames.")
+                        raise ValueError("[av] Invalid image found in video frames.")
 
                 frames = video
                 fps_per_video.append(kwargs.get("video_fps", 2.0))
                 durations.append(len(frames) / kwargs.get("video_fps", 2.0))
             else:
-                container = av.open(video, "r")
-                video_stream = next(stream for stream in container.streams if stream.type == "video")
-                sample_indices = self._get_video_sample_indices(video_stream, **kwargs)
-                container.seek(0)
-                for frame_idx, frame in enumerate(container.decode(video_stream)):
-                    if frame_idx in sample_indices:
-                        frames.append(frame.to_image())
+                container = None
+                try:
+                    # container = av.open(video, "r")
+                    container = av.open(video, 'r',)
+                    video_stream = next(stream for stream in container.streams if stream.type == "video")
 
-                if video_stream.duration is None:
-                    fps_per_video.append(kwargs.get("video_fps", 2.0))
-                    durations.append(len(frames) / kwargs.get("video_fps", 2.0))
-                else:
-                    fps_per_video.append(len(sample_indices) / float(video_stream.duration * video_stream.time_base))
-                    durations.append(float(video_stream.duration * video_stream.time_base))
+                    assert video_stream.frames > 0, "[av] video has no frames"
+
+                    if crop_interval is not None:
+                        kwargs['crop_interval'] = crop_interval
+                    sample_indices = self._get_video_sample_indices(video_stream, **kwargs)
+                    container.seek(0)
+                    frame_idx = 0
+                    for packet in container.demux(video=0):
+                        try:
+                            for frame in packet.decode():
+                                if frame_idx in sample_indices:
+                                    arr = frame.to_ndarray(format="rgb24").copy()
+                                    frames.append(Image.fromarray(arr))
+                                frame_idx += 1
+                        except av.AVError as e:
+                            # print("Skipping broken frame.")
+                            # continue
+                            raise e
+
+                    if video_stream.duration is None:
+                        fps_per_video.append(kwargs.get("video_fps", 2.0))
+                        durations.append(len(frames) / kwargs.get("video_fps", 2.0))
+                    else:
+                        fps_per_video.append(len(sample_indices) / float(video_stream.duration * video_stream.time_base))
+                        durations.append(float(video_stream.duration * video_stream.time_base))
+
+                    assert len(frames) > 0, "[av] sample frames is empty"
+                    
+                except Exception as e:
+                    # Log the video path that caused the error, then re-raise the exception
+                    error_msg = f"video_path: {video}, error message: {str(e)}" if e else "Unknown video decoding error"
+                    # print(f"[ERROR] Failed to parse video: {video}")
+                    # print(f"[ERROR] Error message: {error_msg}")
+                    # Re-raise the exception to let it propagate to supervised.py
+                    raise Exception(f"[av] {error_msg}")
+                finally:
+                    if container is not None:
+                        try:
+                            container.close()
+                        except Exception:
+                            pass
 
             if len(frames) % 2 != 0:
                 frames.append(frames[-1])
+            
+            # print(f"[av] len(frames): {len(frames)}, crop_interval: {crop_interval}")
+
+            frames = self._regularize_images(frames, **kwargs)["images"]
+            results.append(frames)
+
+        return {"videos": results, "fps_per_video": fps_per_video, "durations": durations}
+
+
+
+    @override
+    def _regularize_videos_decord(self, videos: list["VideoInput"], **kwargs) -> "RegularizedVideoOutput":
+        r"""Regularizes videos to avoid error using decord. Including reading, resizing and converting."""
+        results, fps_per_video, durations = [], [], []
+
+        
+        for idx_video, _video in enumerate(videos):
+
+            if isinstance(_video, dict):
+                video = _video["url"]
+                crop_interval = _video.get("crop", None) if idx_video>0 else None
+                if crop_interval is not None and crop_interval[0] == -1.0 and crop_interval[1] == -1.0:
+                    crop_interval = None
+            else:
+                video = _video
+                crop_interval = None
+                
+            kwargs['idx_video'] = idx_video
+            kwargs['video_path'] = video
+            kwargs['num_video'] = len(videos)
+            frames: list[ImageObject] = []
+
+            if _check_video_is_nested_images(video):
+                for frame in video:
+                    if not is_valid_image(frame) and not isinstance(frame, dict) and not os.path.exists(frame):
+                        raise ValueError("[decord] Invalid image found in video frames.")
+
+                frames = video
+                fps_per_video.append(kwargs.get("video_fps", 2.0))
+                durations.append(len(frames) / kwargs.get("video_fps", 2.0))
+            else:
+                vr = None
+                try:
+                    if not is_decord_available:
+                        raise ImportError("decord is not available. Please install it with: pip install decord")
+                    
+                    vr = VideoReader(video)
+                    total_frames = len(vr)
+                    avg_fps = vr.get_avg_fps() 
+
+                    assert avg_fps > 0, "[decord] video fps is invalid"
+                    assert total_frames > 0, "[decord] video has no frames"
+                    
+                    # Create a mock video_stream object for _get_video_sample_indices
+                    # Note: duration should never be None because _get_video_sample_indices requires it
+                    class DecordVideoStream:
+                        def __init__(self, total_frames, avg_fps):
+                            self.frames = total_frames
+                            self.average_rate = avg_fps
+                            # Calculate duration from frames and fps
+                            # Ensure duration is never None to match av behavior
+                            if avg_fps > 0 and total_frames > 0:
+                                self.duration = total_frames / avg_fps
+
+                            self.time_base = 1.0
+                    
+                    video_stream = DecordVideoStream(total_frames, avg_fps)
+
+                    if crop_interval is not None:
+                        kwargs['crop_interval'] = crop_interval
+                    sample_indices = self._get_video_sample_indices(video_stream, **kwargs)
+                    
+                    # Get frames at sample indices
+                    for frame_idx in sample_indices:
+                        if frame_idx < total_frames:
+                            frame_array = vr[frame_idx].asnumpy()
+                            frames.append(Image.fromarray(frame_array))
+
+                    if video_stream.duration is None:
+                        fps_per_video.append(kwargs.get("video_fps", 2.0))
+                        durations.append(len(frames) / kwargs.get("video_fps", 2.0))
+                    else:
+                        fps_per_video.append(len(sample_indices) / float(video_stream.duration * video_stream.time_base))
+                        durations.append(float(video_stream.duration * video_stream.time_base))
+
+                    assert len(frames) > 0, "[decord] sample frames is empty"
+                    
+                except Exception as e:
+                    # Log the video path that caused the error, then re-raise the exception
+                    error_msg = f"video_path: {video}, error message: {str(e)}" if e else "Unknown video decoding error"
+                    # print(f"[ERROR] Failed to parse video: {video}")
+                    # print(f"[ERROR] Error message: {error_msg}")
+                    # Re-raise the exception to let it propagate to supervised.py
+                    raise Exception(f"[decord] {error_msg}")
+                finally:
+                    if vr is not None:
+                        try:
+                            del vr
+                        except Exception:
+                            pass
+
+            if len(frames) % 2 != 0:
+                frames.append(frames[-1])
+            
+            # print(f"[decord] len(frames): {len(frames)}, crop_interval: {crop_interval}")
 
             frames = self._regularize_images(frames, **kwargs)["images"]
             results.append(frames)
@@ -1532,11 +1850,40 @@ class Qwen2VLPlugin(BasePlugin):
                 image_min_pixels=getattr(processor, "video_min_pixels", 16 * 16),
                 video_fps=getattr(processor, "video_fps", 2.0),
                 video_maxlen=getattr(processor, "video_maxlen", 128),
+                max_token_number=getattr(processor, "max_token_number", None),
+                min_token_number=getattr(processor, "min_token_number", None),
             )
-            mm_inputs.update(video_processor(videos=video_data["videos"], return_tensors="pt"))
+
+            # print(f"len(video_data['videos']): {len(video_data['videos'][0])}")
+            # print(f"shape(video_data['videos'][0]): {video_data['videos'][0][0].size}")
+            try:
+                mm_inputs.update(video_processor(videos=video_data["videos"], return_tensors="pt"))
+            except Exception as e:
+                # 保存 video_data["videos"] 用于调试
+                try:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    # 使用视频路径的一部分作为文件名（如果可能）
+                    video_name = videos[0]['url']
+                    # if videos and len(videos) > 0:
+                    #     # 从第一个视频路径提取文件名
+                    #     first_video = str(videos[0])
+                    #     video_name = os.path.basename(first_video).replace(".", "_")[:50]
+                    save_path = f"/mnt/petrelfs/zhangzhiqiu/processor_error/video_data_error_{video_name}_{timestamp}.pkl"
+                    with open(save_path, "wb") as f:
+                        pickle.dump(video_data["videos"], f)
+                    error_msg = (f"Failed to use video_processor: {e}, video_path: {video_name}, saved video_data to {save_path}")
+                except Exception as save_error:
+                    error_msg = (f"Failed to use video_processor: {e}, video_path: {video_name}, failed to save video_data: {save_error}")
+                raise Exception(f"[Processor] {error_msg}")
+
+                
             temporal_patch_size: int = getattr(image_processor, "temporal_patch_size", 2)
             if "second_per_grid_ts" in processor.model_input_names:
                 mm_inputs["second_per_grid_ts"] = [temporal_patch_size / fps for fps in video_data["fps_per_video"]]
+
+            # print("*" * 30)
+            # print(f"mm_inputs['video_grid_thw'][0].prod(): {mm_inputs['video_grid_thw'][0].prod()}")
+            # print("*" * 30)
 
         return mm_inputs
 
@@ -1582,6 +1929,7 @@ class Qwen2VLPlugin(BasePlugin):
                     f"{self.vision_bos_token}{self.video_token * video_seqlen}{self.vision_eos_token}",
                     1,
                 )
+                # print("video_seqlen: ", video_seqlen)
                 num_video_tokens += 1
 
             message["content"] = content
@@ -1617,6 +1965,8 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
                 image_min_pixels=getattr(processor, "video_min_pixels", 16 * 16),
                 video_fps=getattr(processor, "video_fps", 2.0),
                 video_maxlen=getattr(processor, "video_maxlen", 128),
+                max_token_number=getattr(processor, "max_token_number", None),
+                min_token_number=getattr(processor, "min_token_number", None),
             )
             video_metadata = [
                 {"fps": getattr(processor, "video_fps", 24.0), "duration": duration, "total_num_frames": len(video)}
@@ -1735,6 +2085,8 @@ class GLM4VPlugin(Qwen2VLPlugin):
                 image_min_pixels=getattr(processor, "video_min_pixels", 16 * 16),
                 video_fps=getattr(processor, "video_fps", 2.0),
                 video_maxlen=getattr(processor, "video_maxlen", 128),
+                max_token_number=getattr(processor, "max_token_number", None),
+                min_token_number=getattr(processor, "min_token_number", None),
             )
             # prepare video metadata
             video_metadata = [
@@ -1870,6 +2222,8 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                 image_min_pixels=getattr(processor, "video_min_pixels", 16 * 16),
                 video_fps=getattr(processor, "video_fps", 2.0),
                 video_maxlen=getattr(processor, "video_maxlen", 128),
+                max_token_number=getattr(processor, "max_token_number", None),
+                min_token_number=getattr(processor, "min_token_number", None),
             )
             mm_inputs.update(video_processor(videos=video_dict["videos"], return_tensors="pt"))
             temporal_patch_size: int = getattr(image_processor, "temporal_patch_size", 2)

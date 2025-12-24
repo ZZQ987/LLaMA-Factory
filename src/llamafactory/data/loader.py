@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import os
+import shutil
+import glob
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import numpy as np
-from datasets import Dataset, load_dataset, load_from_disk
+from datasets import Dataset, IterableDataset, load_dataset, load_from_disk, concatenate_datasets
 
 from ..extras import logging
 from ..extras.constants import FILEEXT2TYPE
@@ -252,13 +254,100 @@ def _get_preprocessed_dataset(
             desc="Running tokenizer on dataset",
         )
 
-    dataset = dataset.map(
-        dataset_processor.preprocess_dataset,
-        batched=True,
-        batch_size=data_args.preprocessing_batch_size,
-        remove_columns=column_names,
-        **kwargs,
+    # 如果指定了 tokenized_path，启用增量保存模式
+    incremental_save = (
+        data_args.tokenized_path is not None 
+        and not data_args.streaming 
+        and training_args.should_save
+        and isinstance(dataset, Dataset)  # 只对 Dataset 类型启用，不支持 IterableDataset
+        and hasattr(dataset, "__len__")
     )
+    
+    if incremental_save:
+        # 增量保存模式：将数据集分成多个 shard，每个 shard 处理完后立即保存
+        dataset_len = len(dataset)
+        # 每个 shard 的大小：默认每 10000 条保存一次，可根据数据集大小调整
+        shard_size = max(min(dataset_len//10 + 1, 2500), 1000)
+        num_shards = (dataset_len + shard_size - 1) // shard_size
+        
+        # 创建临时目录用于保存 shard
+        base_path = data_args.tokenized_path
+        shard_dir = f"{base_path}_shards"
+        os.makedirs(shard_dir, exist_ok=True)
+        
+        # 检查是否所有 shard 都已存在
+        all_shards_exist = all(
+            os.path.exists(os.path.join(shard_dir, f"shard_{i:04d}"))
+            for i in range(num_shards)
+        )
+        
+        if all_shards_exist and not data_args.overwrite_cache:
+            # 所有 shard 都已存在，直接加载并合并
+            logger.info_rank0(f"检测到所有 {num_shards} 个 shard 已处理完成，直接加载...")
+            processed_shards = []
+            for shard_idx in range(num_shards):
+                shard_path = os.path.join(shard_dir, f"shard_{shard_idx:04d}")
+                try:
+                    shard_dataset = load_from_disk(shard_path)
+                    processed_shards.append(shard_dataset)
+                except Exception as e:
+                    logger.warning_rank0(f"加载 shard {shard_idx} 失败，将重新处理: {e}")
+                    all_shards_exist = False
+                    break
+            
+            if all_shards_exist and len(processed_shards) == num_shards:
+                logger.info_rank0(f"成功加载所有 {num_shards} 个 shard，正在合并...")
+                dataset = concatenate_datasets(processed_shards)
+                logger.info_rank0("所有 shard 合并完成")
+                return dataset
+        
+        # 需要处理 shard（部分或全部）
+        processed_shards = []
+        for shard_idx in range(num_shards):
+            start_idx = shard_idx * shard_size
+            end_idx = min((shard_idx + 1) * shard_size, dataset_len)
+            shard_path = os.path.join(shard_dir, f"shard_{shard_idx:04d}")
+            
+            # 检查 shard 是否已经处理过
+            if os.path.exists(shard_path) and not data_args.overwrite_cache:
+                logger.info_rank0(f"加载已处理的 shard {shard_idx + 1}/{num_shards} (索引 {start_idx}-{end_idx})...")
+                try:
+                    shard_dataset = load_from_disk(shard_path)
+                    processed_shards.append(shard_dataset)
+                    continue
+                except Exception as e:
+                    logger.warning_rank0(f"加载 shard {shard_idx} 失败，将重新处理: {e}")
+            
+            # 处理当前 shard
+            logger.info_rank0(f"处理 shard {shard_idx + 1}/{num_shards} (索引 {start_idx}-{end_idx})...")
+            shard = dataset.select(range(start_idx, end_idx))
+            
+            shard = shard.map(
+                dataset_processor.preprocess_dataset,
+                batched=True,
+                batch_size=data_args.preprocessing_batch_size,
+                remove_columns=column_names,
+                **kwargs,
+            )
+            
+            # 立即保存当前 shard
+            shard.save_to_disk(shard_path)
+            logger.info_rank0(f"Shard {shard_idx + 1}/{num_shards} 已保存到 {shard_path}")
+            processed_shards.append(shard)
+        
+        # 合并所有 shard
+        logger.info_rank0(f"合并 {len(processed_shards)} 个 shard...")
+        dataset = concatenate_datasets(processed_shards)
+        logger.info_rank0("所有 shard 合并完成")
+    else:
+        # 原有的处理方式
+        dataset = dataset.map(
+            dataset_processor.preprocess_dataset,
+            batched=True,
+            batch_size=data_args.preprocessing_batch_size,
+            remove_columns=column_names,
+            **kwargs,
+        )
 
     if training_args.should_log:
         try:
@@ -328,7 +417,32 @@ def get_dataset(
         if data_args.tokenized_path is not None:  # save tokenized dataset to disk
             if training_args.should_save:
                 dataset_dict.save_to_disk(data_args.tokenized_path)
+                print(f"Tokenized dataset is saved at {data_args.tokenized_path}.")
                 logger.info_rank0(f"Tokenized dataset is saved at {data_args.tokenized_path}.")
                 logger.info_rank0(f"Please launch the training with `tokenized_path: {data_args.tokenized_path}`.")
+                
+                # 清理之前保存的 shard 目录
+                base_path = data_args.tokenized_path
+                shard_dir = f"{base_path}_shards"
+                
+                if os.path.exists(shard_dir):
+                    try:
+                        shutil.rmtree(shard_dir)
+                        logger.info_rank0(f"已清理 shard 目录: {shard_dir}")
+                    except Exception as e:
+                        logger.warning_rank0(f"清理 shard 目录 {shard_dir} 失败: {e}")
+                
+                # 清理转换后的数据集目录（格式: {base_path}_converted_{hash}）
+                # 转换后的数据集路径格式为: {base_path}_converted_{hash}
+                converted_pattern = f"{base_path}_converted_*"
+                converted_dirs = glob.glob(converted_pattern)
+                
+                for converted_dir in converted_dirs:
+                    if os.path.isdir(converted_dir):
+                        try:
+                            shutil.rmtree(converted_dir)
+                            logger.info_rank0(f"已清理转换后的数据集目录: {converted_dir}")
+                        except Exception as e:
+                            logger.warning_rank0(f"清理转换后的数据集目录 {converted_dir} 失败: {e}")
 
         return get_dataset_module(dataset_dict)

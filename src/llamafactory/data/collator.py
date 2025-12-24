@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import traceback
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
@@ -105,6 +106,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         else:
             self.get_rope_func = None
 
+
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
@@ -165,16 +167,23 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
             batch_input_ids[0] = features[0]["input_ids"]
 
-        mm_inputs = self.template.mm_plugin.get_mm_inputs(
-            batch_images,
-            batch_videos,
-            batch_audios,
-            batch_imglens,
-            batch_vidlens,
-            batch_audlens,
-            batch_input_ids,
-            self.processor,
-        )
+        try:
+            mm_inputs = self.template.mm_plugin.get_mm_inputs(
+                batch_images,
+                batch_videos,
+                batch_audios,
+                batch_imglens,
+                batch_vidlens,
+                batch_audlens,
+                batch_input_ids,
+                self.processor,
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to get mm_inputs, Error: {str(e)}")
+            print(f"[WARN] Traceback: {traceback.format_exc()}")
+            raise e
+
+
         if "token_type_ids" in mm_inputs:
             token_type_ids = mm_inputs.pop("token_type_ids")
             for i, feature in enumerate(features):
@@ -240,7 +249,6 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
         return features
 
-
 @dataclass
 class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
     r"""Data collator for 4d attention mask."""
@@ -248,9 +256,48 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
     block_diag_attn: bool = False
     attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "eager"
     compute_dtype: "torch.dtype" = torch.float32
+    _backup_features: Optional[dict[str, "torch.Tensor"]] = None
+    try_backup: bool = False
+
+    def get_backup_features(self) -> dict[str, "torch.Tensor"]:
+        temp_features = {}
+        for key, value in self._backup_features.items():
+            if torch.is_tensor(value):
+                temp_features[key] = value.clone()
+            else:
+                temp_features[key] = value
+        return temp_features
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
-        features = super().__call__(features)
+        try:
+            processed_features = super().__call__(features)
+            # 如果成功处理，保存为备用 feature（第一个成功处理的完整 batch）
+
+            if self._backup_features is None:
+                self._backup_features = {}
+                for k, v in processed_features.items():
+                    if torch.is_tensor(v):
+                        self._backup_features[k] = v.clone()
+                    else:
+                        self._backup_features[k] = v
+            # else:
+            #     if self.try_backup == False:
+            #         processed_features = self.get_backup_features()
+            #         print("try to use backup features")
+            #         self.try_backup = True
+
+            features = processed_features
+        except Exception as e:
+            # 如果处理失败，使用备用 feature（直接使用保存的完整 batch）
+            if self._backup_features is not None:
+                print(f"[WARN] Failed to process batch in collator, using backup feature. Error: {str(e)}")
+                print(f"[WARN] Traceback: {traceback.format_exc()}")
+                # 直接使用备用 feature（完整的 batch）
+                features = self.get_backup_features()
+            else:
+                # 如果没有备用 feature，重新抛出异常
+                raise e
+        
         if self.block_diag_attn and self.attn_implementation != "flash_attention_2":
             features["attention_mask"] = prepare_4d_attention_mask(features["attention_mask"], self.compute_dtype)
 

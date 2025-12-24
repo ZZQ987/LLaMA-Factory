@@ -20,12 +20,12 @@ from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from .processor_utils import DatasetProcessor, greedy_knapsack, infer_seqlen
 
-
 if TYPE_CHECKING:
     from ..mm_plugin import AudioInput, ImageInput, VideoInput
 
-
 logger = logging.get_logger(__name__)
+
+import traceback
 
 
 @dataclass
@@ -40,7 +40,20 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         videos: list["VideoInput"],
         audios: list["AudioInput"],
     ) -> tuple[list[int], list[int]]:
-        messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
+        try:
+            messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
+        except Exception as e:
+
+            logger.warning_rank0(
+                f"Failed to process messages. Error: {e}"
+            )
+            raise e
+            # # 返回一个最小的有效结果，所有labels设置为IGNORE_INDEX以屏蔽loss计算
+            # # 使用一个最小的input_ids（至少包含bos token）和对应的IGNORE_INDEX labels
+            # min_input_ids = [self.tokenizer.bos_token_id] if self.tokenizer.bos_token_id is not None else [self.tokenizer.pad_token_id]
+            # min_labels = [IGNORE_INDEX] * len(min_input_ids)
+            # return min_input_ids, min_labels
+        
         input_ids, labels = self.template.mm_plugin.process_token_ids(
             [], [], images, videos, audios, self.tokenizer, self.processor
         )
@@ -96,15 +109,25 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 )
                 continue
 
-            input_ids, labels = self._encode_data_example(
-                prompt=examples["_prompt"][i],
-                response=examples["_response"][i],
-                system=examples["_system"][i],
-                tools=examples["_tools"][i],
-                images=examples["_images"][i] or [],
-                videos=examples["_videos"][i] or [],
-                audios=examples["_audios"][i] or [],
-            )
+            try:
+                input_ids, labels = self._encode_data_example(
+                    prompt=examples["_prompt"][i],
+                    response=examples["_response"][i],
+                    system=examples["_system"][i],
+                    tools=examples["_tools"][i],
+                    images=examples["_images"][i] or [],
+                    videos=examples["_videos"][i] or [],
+                    audios=examples["_audios"][i] or [],
+                )
+            except Exception as e:
+                logger.warning_rank0(
+                    f"Failed to encode example {i}, dropping it. Error: {e}"
+                )
+                logger.warning_rank0(
+                    f"Traceback: {traceback.format_exc()}"
+                )
+                continue
+
             model_inputs["input_ids"].append(input_ids)
             model_inputs["attention_mask"].append([1] * len(input_ids))
             model_inputs["labels"].append(labels)
@@ -139,15 +162,22 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
                 )
                 continue
 
-            input_ids, labels = self._encode_data_example(
-                prompt=examples["_prompt"][i],
-                response=examples["_response"][i],
-                system=examples["_system"][i],
-                tools=examples["_tools"][i],
-                images=examples["_images"][i] or [],
-                videos=examples["_videos"][i] or [],
-                audios=examples["_audios"][i] or [],
-            )
+            try:
+                input_ids, labels = self._encode_data_example(
+                    prompt=examples["_prompt"][i],
+                    response=examples["_response"][i],
+                    system=examples["_system"][i],
+                    tools=examples["_tools"][i],
+                    images=examples["_images"][i] or [],
+                    videos=examples["_videos"][i] or [],
+                    audios=examples["_audios"][i] or [],
+                )
+            except Exception as e:
+                logger.warning_rank0(
+                    f"Failed to encode example {i}, dropping it. Error: {e}"
+                )
+                continue
+
             length = len(input_ids)
             if length > self.data_args.cutoff_len:
                 logger.warning_rank0(f"Dropped lengthy example with length {length} > {self.data_args.cutoff_len}.")

@@ -11,13 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import json
 import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+from datasets import load_from_disk
+
 from ..extras import logging
+from ..extras.misc import has_tokenized_data
 from .data_utils import Role
 
 
@@ -52,15 +56,18 @@ class DatasetConverter:
             medias = medias[:]
 
         if self.dataset_attr.load_from in ["script", "file"]:
+            # 如果是单个路径
             if isinstance(medias[0], str):
                 for i in range(len(medias)):
                     media_path = os.path.join(self.data_args.media_dir, medias[i])
+                    # media_path = medias[i]
                     if os.path.isfile(media_path):
                         medias[i] = media_path
                     else:
                         logger.warning_rank0_once(
                             f"Media {medias[i]} does not exist in `media_dir`. Use original path."
                         )
+            # 如果是列表
             elif isinstance(medias[0], list):  # for processed video frames
                 # medias is a list of lists, e.g., [[frame1.jpg, frame2.jpg], [frame3.jpg, frame4.jpg]]
                 for i in range(len(medias)):
@@ -72,6 +79,16 @@ class DatasetConverter:
                             logger.warning_rank0_once(
                                 f"Media {medias[i][j]} does not exist in `media_dir`. Use original path."
                             )
+            # 如果是字典
+            elif isinstance(medias[0], dict):
+                for i in range(len(medias)):
+                    media_path = os.path.join(self.data_args.media_dir, medias[i]["url"])
+                    if os.path.isfile(media_path):
+                        medias[i]["url"] = media_path
+                    else:
+                        logger.warning_rank0_once(
+                            f"Media {medias[i]['url']} does not exist in `media_dir`. Use original path."
+                        )
 
         return medias
 
@@ -407,6 +424,41 @@ def align_dataset(
     _videos: []
     _audios: []
     """
+    # 如果指定了 tokenized_path，尝试保存/加载转换后的数据集
+    aligned_dataset_path = None
+    if data_args.tokenized_path is not None and not data_args.streaming:
+        # 生成转换后数据集的保存路径：与 shard 命名方式对齐
+        base_path = data_args.tokenized_path
+        
+        # 生成数据集标识符：使用数据集名称、子集、分割等信息
+        dataset_id_parts = [
+            dataset_attr.dataset_name or "unknown",
+            dataset_attr.subset or "",
+            dataset_attr.split or "train",
+            dataset_attr.formatting or "alpaca",
+        ]
+        dataset_id = "_".join(filter(None, dataset_id_parts))
+        # 使用 hash 确保路径不会太长，并区分不同的数据集
+        dataset_id_hash = hashlib.md5(dataset_id.encode()).hexdigest()[:8]
+        # 命名方式与 shard 对齐：{base_path}_converted_{hash}
+        aligned_dataset_path = f"{base_path}_converted_{dataset_id_hash}"
+        
+        # 检查是否已存在转换后的数据集
+        if has_tokenized_data(aligned_dataset_path) and not data_args.overwrite_cache:
+            logger.info_rank0(f"检测到已转换的数据集，尝试加载: {aligned_dataset_path}")
+            try:
+                aligned_dataset = load_from_disk(aligned_dataset_path)
+                logger.info_rank0(f"成功加载转换后的数据集，跳过格式转换步骤")
+
+                # 直接返回
+                return aligned_dataset
+            except Exception as e:
+                logger.warning_rank0(f"加载转换后的数据集失败，将重新转换: {e}")
+        elif data_args.overwrite_cache:
+            logger.info_rank0(f"overwrite_cache=True，将重新转换数据集（忽略已存在的: {aligned_dataset_path}）")
+        else:
+            logger.info_rank0(f"未找到已转换的数据集，将执行格式转换: {aligned_dataset_path}")
+    
     column_names = list(next(iter(dataset)).keys())
     kwargs = {}
     if not data_args.streaming:
@@ -417,9 +469,21 @@ def align_dataset(
         )
 
     dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
-    return dataset.map(
+    aligned_dataset = dataset.map(
         dataset_converter,
         batched=False,
         remove_columns=column_names,
         **kwargs,
     )
+    
+    # 保存转换后的数据集（只保存 Dataset 类型，不保存 IterableDataset）
+    if aligned_dataset_path is not None and training_args.should_save:
+        from datasets import Dataset
+        if isinstance(aligned_dataset, Dataset):
+            try:
+                aligned_dataset.save_to_disk(aligned_dataset_path)
+                logger.info_rank0(f"转换后的数据集已保存到: {aligned_dataset_path}")
+            except Exception as e:
+                logger.warning_rank0(f"保存转换后的数据集失败: {e}")
+    
+    return aligned_dataset
