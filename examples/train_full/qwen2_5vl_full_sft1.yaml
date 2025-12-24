@@ -8,7 +8,7 @@ min_token_number: 1024
 max_token_number: 16384
 trust_remote_code: true
 flash_attn: fa2
-enable_liger_kernel: True
+# enable_liger_kernel: True
 
 ### method
 stage: sft
@@ -29,22 +29,20 @@ cutoff_len: 40000
 # max_samples: 1500
 overwrite_cache: false
 preprocessing_batch_size: 128
-preprocessing_num_workers: 4
-dataloader_num_workers: 2
+preprocessing_num_workers: 16
+dataloader_num_workers: 16
 accelerator_config:
   dispatch_batches: false
 # tokenized_path: /mnt/petrelfs/zhangzhiqiu/sft_data/tokenized_data/2m/dataset/sft
-tokenized_path: /mnt/petrelfs/zhangzhiqiu/LLaMA-Factory/saves/general_clue_data/dataset/sft
+tokenized_path: /mnt/petrelfs/zhangzhiqiu/LLaMA-Factory/saves/preprocessed_data/dataset/sft
 # 187634 样本
-# 500k
 
 ### output
-output_dir: /mnt/petrelfs/zhangzhiqiu/LLaMA-Factory/saves/general_clue_data/ckpt
+output_dir: /mnt/petrelfs/zhangzhiqiu/LLaMA-Factory/saves/longvt_llava_video_think/ckpt
 logging_steps: 2
 save_steps: 100
-save_total_limit: 3
 plot_loss: true
-overwrite_output_dir: false
+overwrite_output_dir: true
 save_only_model: false
 report_to: none  # choices: [none, wandb, tensorboard, swanlab, mlflow]
 
@@ -57,5 +55,5 @@ lr_scheduler_type: cosine
 warmup_ratio: 0.1
 bf16: true
 ddp_timeout: 180000000
-resume_from_checkpoint: /mnt/petrelfs/zhangzhiqiu/LLaMA-Factory/saves/general_clue_data/ckpt/checkpoint-1100
+resume_from_checkpoint: null
 

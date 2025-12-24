@@ -1,0 +1,50 @@
+### model
+model_name_or_path: /disk/zdata1/home/zhangqingyu/work/guiagent/LLaMA-Factory/output/qwen3vl_lora_ground-2-7000
+image_max_pixels: 6144000
+video_max_pixels: 16384
+#trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+freeze_vision_tower: true
+freeze_multi_modal_projector: true
+freeze_language_model: false
+deepspeed: examples/deepspeed/ds_z3_config.json
+
+### dataset
+dataset: train
+template: qwen3_vl_nothink
+cutoff_len: 16384
+#max_samples: null
+overwrite_cache: false
+preprocessing_num_workers: 64
+dataloader_num_workers: 32
+
+### output
+output_dir: saves/qwen3vl-2b/full_image_ground/sft
+logging_steps: 10
+save_steps: 1000
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+save_total_limit: 3
+report_to: none  # choices: [none, wandb, tensorboard, swanlab, mlflow]
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-5
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+resume_from_checkpoint: /disk/zdata1/home/zhangqingyu/work/guiagent/LLaMA-Factory/saves/qwen3vl-2b/full_image_ground/sft/checkpoint-3000
+
+### eval
+# val_size: 0.1
+# per_device_eval_batch_size: 1
+# eval_strategy: steps
+# eval_steps: 500
