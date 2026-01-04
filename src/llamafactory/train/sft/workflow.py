@@ -54,6 +54,19 @@ def run_sft(
     if getattr(model, "is_quantized", False) and not training_args.do_train:
         setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction
 
+
+    # answer_start_id = tokenizer.convert_tokens_to_ids("<answer>")
+    # answer_end_id = tokenizer.convert_tokens_to_ids("</answer>")
+    # vision_start_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    # vision_end_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+
+    # token_dict = {
+    #     "answer_start_id": answer_start_id,
+    #     "answer_end_id": answer_end_id,
+    #     "vision_start_id": vision_start_id,
+    #     "vision_end_id": vision_end_id,
+    # }
+
     data_collator = SFTDataCollatorWith4DAttentionMask(
         template=template,
         model=model if not training_args.predict_with_generate else None,

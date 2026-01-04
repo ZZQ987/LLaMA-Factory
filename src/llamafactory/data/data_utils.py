@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional, TypedDict, Union
 
 import fsspec
 from datasets import DatasetDict, concatenate_datasets, interleave_datasets
+import torch
 
 from ..extras import logging
 
@@ -188,3 +189,280 @@ def read_cloud_json(cloud_path: str) -> list[Any]:
         raise ValueError(f"No JSON/JSONL files found in the specified path: {cloud_path}.")
 
     return sum([_read_json_with_fs(fs, file) for file in files], [])
+
+
+def convert_2d_to_4d_attention_mask(
+    attention_mask: "torch.Tensor", 
+    dtype: Optional["torch.dtype"] = None,
+    input_ids: Optional["torch.Tensor"] = None,
+    tokenizer: Optional[Any] = None,
+    mask_answer_from_first_video: bool = False,
+    mask_grounding_from_other_videos: bool = False,
+) -> "torch.Tensor":
+    r"""Convert 2D attention mask to 4D attention mask.
+    
+    Convert a standard 2D attention mask [batch_size, seq_len] to 4D format [batch_size, 1, seq_len, seq_len]
+    with causal masking and padding masking applied.
+    
+    Args:
+        attention_mask: 2D tensor of shape [batch_size, seq_len], where 1 indicates valid tokens and 0 indicates padding
+        dtype: Optional dtype for the output mask. If None, uses bool dtype.
+        input_ids: Optional tensor of shape [batch_size, seq_len] for identifying answer and video segments.
+        tokenizer: Optional tokenizer for getting special token IDs.
+        mask_answer_from_first_video: If True and there are multiple video segments (>1), 
+            mask the first video from answer tokens.
+        mask_grounding_from_other_videos: If True and there are multiple video segments (>1), 
+            mask all videos except the first video from grounding tokens.
+    
+    Returns:
+        4D tensor of shape [batch_size, 1, seq_len, seq_len]. 
+        For bool dtype: True indicates allowed attention, False indicates blocked.
+        For float dtype: 0.0 indicates allowed attention, large_negative indicates blocked (additive bias format).
+    """
+    # Ensure we're working with the correct shape
+    if attention_mask.dim() != 2:
+        raise ValueError(f"Expected 2D attention mask, got shape {attention_mask.shape}")
+    
+    B, L = attention_mask.shape
+    device = attention_mask.device
+    
+    # Convert to bool mask (1/True for valid tokens, 0/False for padding)
+    # Use >= 1 to handle cases where mask might have values > 1
+    valid = (attention_mask >= 1).bool()
+    
+    # Create causal mask (lower triangular, including diagonal)
+    causal = torch.tril(torch.ones((L, L), dtype=torch.bool, device=device))
+    
+    # Initialize allowed mask with causal mask: [B, L, L]
+    # Use broadcasting instead of loop for efficiency
+    allowed = causal.unsqueeze(0).expand(B, -1, -1).clone()  # [B, L, L]
+    
+    # Apply padding mask: both query and key must be valid
+    # Use broadcasting for efficiency
+    valid_query = valid.unsqueeze(1)  # [B, 1, L] - for queries (rows)
+    valid_key = valid.unsqueeze(2)    # [B, L, 1] - for keys (columns)
+    allowed = allowed & valid_query & valid_key  # [B, L, L]
+
+    
+    # Apply answer-to-first-video masking if enabled
+    if mask_answer_from_first_video and input_ids is not None and tokenizer is not None:
+
+
+        try:
+            print("masking answer from first video")
+            # Get special token IDs
+            answer_start_id = tokenizer("<answer>").input_ids
+            answer_end_id = tokenizer("</answer>").input_ids
+            vision_start_id = tokenizer("<|vision_start|>").input_ids
+            vision_end_id = tokenizer("<|vision_end|>").input_ids
+
+            # [27, 9217, 29]
+            # [522, 9217, 29]
+            # [151652]
+            # [151653]
+
+            print(f"answer_start_id: {answer_start_id}, answer_end_id: {answer_end_id}, vision_start_id: {vision_start_id}, vision_end_id: {vision_end_id}")
+            
+            # Check if all required tokens exist
+            if answer_start_id is not None and answer_end_id is not None and \
+               vision_start_id is not None and vision_end_id is not None:
+                
+                # Extract single token IDs for vision tokens (they are single-token lists)
+                vision_start_token = vision_start_id[0] if len(vision_start_id) > 0 else None
+                vision_end_token = vision_end_id[0] if len(vision_end_id) > 0 else None
+                
+                # Helper function to find sequence matches in input_ids
+                def find_sequence_positions(ids, sequence):
+                    """Find all positions where the sequence starts in ids."""
+                    if len(sequence) == 0:
+                        return torch.tensor([], dtype=torch.long, device=ids.device)
+                    positions = []
+                    seq_len = len(sequence)
+                    for i in range(len(ids) - seq_len + 1):
+                        if torch.equal(ids[i:i+seq_len], torch.tensor(sequence, device=ids.device, dtype=ids.dtype)):
+                            positions.append(i)
+                    return torch.tensor(positions, dtype=torch.long, device=ids.device) if positions else torch.tensor([], dtype=torch.long, device=ids.device)
+                
+                for b in range(B):
+                    ids = input_ids[b]  # [L]
+                    
+                    # Find all vision segments (video segments) - single token matching
+                    v_starts = torch.nonzero(ids == vision_start_token, as_tuple=False).squeeze(-1)
+                    v_ends = torch.nonzero(ids == vision_end_token, as_tuple=False).squeeze(-1)
+                    
+                    # Pair vision start and end tags
+                    v_ptr, e_ptr = 0, 0
+                    vision_segments = []
+                    while v_ptr < v_starts.numel() and e_ptr < v_ends.numel():
+                        if v_starts[v_ptr] < v_ends[e_ptr]:
+                            vision_segments.append((v_starts[v_ptr].item(), v_ends[e_ptr].item()))
+                            v_ptr += 1
+                            e_ptr += 1
+                        else:
+                            e_ptr += 1
+                    
+                    # Only apply masking if there are more than 1 video segments (excluding question image)
+                    # The first vision segment is typically the question image, so we count video segments after it
+                    if len(vision_segments) > 1:
+                        # Get the first video segment (second vision segment, index 1)
+                        # This is the first actual video, not the question image
+                        first_video_start, first_video_end = vision_segments[1]
+                        # Get all token indices within the first video segment (exclusive of start/end tags)
+                        first_video_indices = torch.arange(first_video_start + 1, first_video_end, device=device, dtype=torch.long)
+
+                        print(f"len of fiirst video: {first_video_end - first_video_start + 1}")
+                        
+                        # Find answer segments - sequence matching
+                        answer_starts = find_sequence_positions(ids, answer_start_id)
+                        answer_ends = find_sequence_positions(ids, answer_end_id)
+                        
+                        # Adjust answer_end positions to point to the end of the sequence
+                        if answer_ends.numel() > 0:
+                            answer_ends = answer_ends + len(answer_end_id) - 1
+                        
+                        # Pair answer start and end tags
+                        a_ptr, e_ptr = 0, 0
+                        answer_segments = []
+                        while a_ptr < answer_starts.numel() and e_ptr < answer_ends.numel():
+                            if answer_starts[a_ptr] < answer_ends[e_ptr]:
+                                # answer_start points to the start of the sequence, answer_end points to the end
+                                answer_segments.append((answer_starts[a_ptr].item(), answer_ends[e_ptr].item()))
+                                a_ptr += 1
+                                e_ptr += 1
+                            else:
+                                e_ptr += 1
+                        
+                        # Mask first video from all answer tokens
+                        for ans_start, ans_end in answer_segments:
+                            # Skip the answer tag tokens themselves, only mask the content
+                            answer_indices = torch.arange(ans_start + len(answer_start_id), ans_end, device=device, dtype=torch.long)
+                            if answer_indices.numel() > 0 and first_video_indices.numel() > 0:
+                                # Set attention from answer tokens (queries) to first video tokens (keys) to False
+                                allowed[b][answer_indices.unsqueeze(1), first_video_indices] = False
+        except Exception as e:
+            # If any error occurs (e.g., token not found), just continue without this masking
+            import warnings
+            warnings.warn(f"Failed to apply answer-to-first-video masking: {e}. Continuing without this feature.")
+    
+    # Apply grounding-to-other-videos masking if enabled
+    if mask_grounding_from_other_videos and input_ids is not None and tokenizer is not None:
+        try:
+            print("masking grounding from other videos")
+            # Get special token IDs
+            grounding_start_id = tokenizer("<grounding>").input_ids
+            grounding_end_id = tokenizer("</grounding>").input_ids
+            vision_start_id = tokenizer("<|vision_start|>").input_ids
+            vision_end_id = tokenizer("<|vision_end|>").input_ids
+
+            print(f"grounding_start_id: {grounding_start_id}, grounding_end_id: {grounding_end_id}, vision_start_id: {vision_start_id}, vision_end_id: {vision_end_id}")
+            
+            # Check if all required tokens exist
+            if grounding_start_id is not None and grounding_end_id is not None and \
+               vision_start_id is not None and vision_end_id is not None:
+                
+                # Extract single token IDs for vision tokens (they are single-token lists)
+                vision_start_token = vision_start_id[0] if len(vision_start_id) > 0 else None
+                vision_end_token = vision_end_id[0] if len(vision_end_id) > 0 else None
+                
+                # Helper function to find sequence matches in input_ids
+                def find_sequence_positions(ids, sequence):
+                    """Find all positions where the sequence starts in ids."""
+                    if len(sequence) == 0:
+                        return torch.tensor([], dtype=torch.long, device=ids.device)
+                    positions = []
+                    seq_len = len(sequence)
+                    for i in range(len(ids) - seq_len + 1):
+                        if torch.equal(ids[i:i+seq_len], torch.tensor(sequence, device=ids.device, dtype=ids.dtype)):
+                            positions.append(i)
+                    return torch.tensor(positions, dtype=torch.long, device=ids.device) if positions else torch.tensor([], dtype=torch.long, device=ids.device)
+                
+                for b in range(B):
+                    ids = input_ids[b]  # [L]
+                    
+                    # Find all vision segments (video segments) - single token matching
+                    v_starts = torch.nonzero(ids == vision_start_token, as_tuple=False).squeeze(-1)
+                    v_ends = torch.nonzero(ids == vision_end_token, as_tuple=False).squeeze(-1)
+                    
+                    # Pair vision start and end tags
+                    v_ptr, e_ptr = 0, 0
+                    vision_segments = []
+                    while v_ptr < v_starts.numel() and e_ptr < v_ends.numel():
+                        if v_starts[v_ptr] < v_ends[e_ptr]:
+                            vision_segments.append((v_starts[v_ptr].item(), v_ends[e_ptr].item()))
+                            v_ptr += 1
+                            e_ptr += 1
+                        else:
+                            e_ptr += 1
+                    
+                    # Only apply masking if there are more than 1 video segments (excluding question image)
+                    # The first vision segment is typically the question image, so we count video segments after it
+                    if len(vision_segments) > 1:
+                        # Get all video segments except the first video (skip index 0 and 1, start from index 2)
+                        # Index 0 is question image, index 1 is first video
+                        other_video_indices = []
+                        for vid_idx in range(2, len(vision_segments)):
+                            vid_start, vid_end = vision_segments[vid_idx]
+                            # Get all token indices within the video segment (exclusive of start/end tags)
+                            vid_indices = torch.arange(vid_start + 1, vid_end, device=device, dtype=torch.long)
+                            other_video_indices.append(vid_indices)
+                        
+                        # Combine all other video indices
+                        if other_video_indices:
+                            all_other_video_indices = torch.cat(other_video_indices)
+                            
+                            # Find grounding segments - sequence matching
+                            grounding_starts = find_sequence_positions(ids, grounding_start_id)
+                            grounding_ends = find_sequence_positions(ids, grounding_end_id)
+                            
+                            # Adjust grounding_end positions to point to the end of the sequence
+                            if grounding_ends.numel() > 0:
+                                grounding_ends = grounding_ends + len(grounding_end_id) - 1
+                            
+                            # Pair grounding start and end tags
+                            g_ptr, e_ptr = 0, 0
+                            grounding_segments = []
+                            while g_ptr < grounding_starts.numel() and e_ptr < grounding_ends.numel():
+                                if grounding_starts[g_ptr] < grounding_ends[e_ptr]:
+                                    # grounding_start points to the start of the sequence, grounding_end points to the end
+                                    grounding_segments.append((grounding_starts[g_ptr].item(), grounding_ends[e_ptr].item()))
+                                    g_ptr += 1
+                                    e_ptr += 1
+                                else:
+                                    e_ptr += 1
+                            
+                            # Mask other videos from all grounding tokens
+                            for grd_start, grd_end in grounding_segments:
+                                # Skip the grounding tag tokens themselves, only mask the content
+                                grounding_indices = torch.arange(grd_start + len(grounding_start_id), grd_end, device=device, dtype=torch.long)
+                                if grounding_indices.numel() > 0 and all_other_video_indices.numel() > 0:
+                                    # Set attention from grounding tokens (queries) to other video tokens (keys) to False
+                                    allowed[b][grounding_indices.unsqueeze(1), all_other_video_indices] = False
+        except Exception as e:
+            # If any error occurs (e.g., token not found), just continue without this masking
+            import warnings
+            warnings.warn(f"Failed to apply grounding-to-other-videos masking: {e}. Continuing without this feature.")
+    
+    # Add head dimension: [B, 1, L, L]
+    allowed = allowed.unsqueeze(1)
+    
+    # Convert to specified dtype if needed
+    if dtype is not None:
+        if dtype == torch.bool:
+            return allowed
+        else:
+            # For float dtypes, convert to additive bias format:
+            # True (allowed) -> 0.0, False (blocked) -> large_negative
+            try:
+                min_dtype = torch.finfo(dtype).min
+            except ValueError:
+                # For integer dtypes, use a large negative value
+                min_dtype = torch.iinfo(dtype).min if hasattr(torch.iinfo(dtype), 'min') else -1e9
+            
+            zero_tensor = torch.zeros(1, dtype=dtype, device=device)
+            min_tensor = torch.full((1,), min_dtype, dtype=dtype, device=device)
+            
+            # Convert bool to float: True -> 0.0, False -> min_dtype
+            result = torch.where(allowed, zero_tensor, min_tensor)
+            return result
+    
+    return allowed

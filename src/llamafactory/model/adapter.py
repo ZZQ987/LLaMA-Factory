@@ -48,6 +48,15 @@ def _setup_full_tuning(
 
     logger.info_rank0("Fine-tuning method: Full")
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
+    # 手动写死：强制冻结 vision tower（针对 qwen2_5_vl 模型）
+    # 注意：从 checkpoint 加载时，model_type 可能是 qwen2_5_vl_text，所以使用包含检查
+    # model_type = getattr(model.config, "model_type", None)
+    # if model_type and "qwen2_5_vl" in model_type and getattr(finetuning_args, "freeze_vision_tower", False):
+    #     vision_modules = ["visual.patch_embed", "visual.blocks"]
+    #     # 强制添加 vision modules，不管 get_forbidden_modules 返回什么
+    #     forbidden_modules.update(vision_modules)
+    #     # 打印与 get_forbidden_modules 相同格式的日志
+    #     logger.info_rank0(f"Set vision model not trainable: {vision_modules}.")
     for name, param in model.named_parameters():
         if not any(forbidden_module in name for forbidden_module in forbidden_modules):
             if cast_trainable_params_to_fp32:

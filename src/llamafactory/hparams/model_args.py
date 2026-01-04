@@ -359,7 +359,7 @@ class ProcessorArguments:
         metadata={"help": "The frames to sample per second for video inputs."},
     )
     video_maxlen: int = field(
-        default=128,
+        default=768,
         metadata={"help": "The maximum number of sampled frames for video inputs."},
     )
     use_audio_in_video: bool = field(

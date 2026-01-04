@@ -30,6 +30,34 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def normalize_videos_field(example: dict) -> dict:
+    r"""
+    Normalize the videos field by adding 'sample' field with value "old_quota" if missing.
+    
+    Some datasets have: List({'crop': List(Value('float64')), 'sample': Value('string'), 'url': Value('string')})
+    Some datasets have: List({'crop': List(Value('float64')), 'url': Value('string')})
+    We need to ensure all have the 'sample' field.
+    """
+    if "videos" in example and example["videos"] is not None:
+        videos = example["videos"]
+        if isinstance(videos, list):
+            normalized_videos = []
+            # add_count = 0
+            for video_item in videos:
+                if isinstance(video_item, dict):
+                    # Add 'sample' field if missing
+                    if "sample" not in video_item:
+                        video_item = video_item.copy()
+                        video_item["sample"] = "old_quota"
+                        # add_count += 1
+                    normalized_videos.append(video_item)
+                else:
+                    normalized_videos.append(video_item)
+            # print("为%d个视频添加了sample字段" % add_count)
+            example["videos"] = normalized_videos
+    return example
+
+
 def load_tokenized_dataset(tokenized_path: str) -> "DatasetDict":
     r"""Load a tokenized dataset from disk, similar to loader.py:288-297."""
     if not has_tokenized_data(tokenized_path):
@@ -51,6 +79,7 @@ def merge_tokenized_datasets(
     data_args: Optional["DataArguments"] = None,
     mix_strategy: str = "concat",
     interleave_probs: Optional[list[float]] = None,
+    sample_sizes: Optional[list[int]] = None,
     seed: int = 42,
     streaming: bool = False,
 ) -> "DatasetDict":
@@ -66,7 +95,10 @@ def merge_tokenized_datasets(
         data_args: Optional DataArguments for advanced merging options
         mix_strategy: Strategy to merge datasets ("concat" or "interleave")
         interleave_probs: Probabilities for interleave strategy (optional)
-        seed: Random seed for interleave strategy
+        sample_sizes: Optional list of sample sizes for each dataset. 
+                     -1 means use all data, positive integer means random sample that many.
+                     If None, all datasets are used fully.
+        seed: Random seed for sampling and interleave strategy
         streaming: Whether to use streaming mode (not recommended for merging)
     
     Returns:
@@ -75,9 +107,39 @@ def merge_tokenized_datasets(
     if not dataset_paths:
         raise ValueError("At least one dataset path must be provided.")
     
+    # Validate sample_sizes if provided
+    if sample_sizes is not None:
+        if len(sample_sizes) != len(dataset_paths):
+            raise ValueError(
+                f"sample_sizes length ({len(sample_sizes)}) must match "
+                f"number of datasets ({len(dataset_paths)})"
+            )
+        for i, size in enumerate(sample_sizes):
+            if size != -1 and size < 1:
+                raise ValueError(
+                    f"sample_sizes[{i}] must be -1 (use all) or a positive integer, got {size}"
+                )
+    
     if len(dataset_paths) == 1:
         logger.warning_rank0("Only one dataset provided, copying instead of merging.")
         dataset = load_tokenized_dataset(dataset_paths[0])
+        
+        # Normalize videos field format (add 'sample' field if missing)
+        for split_name in dataset.keys():
+            logger.info_rank0(f"Normalizing videos field format in {split_name} split...")
+            dataset[split_name] = dataset[split_name].map(normalize_videos_field, desc="Normalizing videos field")
+        
+        # Apply sampling if requested
+        if sample_sizes is not None and sample_sizes[0] != -1:
+            for split_name in dataset.keys():
+                original_size = len(dataset[split_name])
+                sample_size = min(sample_sizes[0], original_size)
+                if sample_size < original_size:
+                    dataset[split_name] = dataset[split_name].shuffle(seed=seed).select(range(sample_size))
+                    logger.info_rank0(
+                        f"Sampled {sample_size} samples from {original_size} in {split_name} split"
+                    )
+        
         if output_path:
             dataset.save_to_disk(output_path)
             logger.info_rank0(f"Dataset copied to {output_path}.")
@@ -85,7 +147,7 @@ def merge_tokenized_datasets(
     
     logger.info_rank0(f"Merging {len(dataset_paths)} tokenized datasets...")
     
-    # Load all datasets
+    # Load all datasets and apply sampling if requested
     datasets_dict = {}
     for i, path in enumerate(dataset_paths):
         logger.info_rank0(f"Loading dataset {i+1}/{len(dataset_paths)}: {path}")
@@ -93,14 +155,38 @@ def merge_tokenized_datasets(
         
         # Extract train dataset from each DatasetDict
         if "train" in dataset_dict:
-            datasets_dict[f"dataset_{i}"] = dataset_dict["train"]
+            dataset = dataset_dict["train"]
         else:
             # If no train split, take the first available split
             first_split = list(dataset_dict.keys())[0]
-            datasets_dict[f"dataset_{i}"] = dataset_dict[first_split]
+            dataset = dataset_dict[first_split]
             logger.warning_rank0(
                 f"No 'train' split found in {path}, using '{first_split}' instead."
             )
+        
+        # Normalize videos field format (add 'sample' field if missing)
+        logger.info_rank0(f"  Normalizing videos field format (adding 'sample' field if missing)...")
+        dataset = dataset.map(normalize_videos_field, desc="Normalizing videos field")
+        
+        # Apply sampling if sample_sizes is provided
+        if sample_sizes is not None:
+            sample_size = sample_sizes[i]
+            if sample_size != -1:
+                original_size = len(dataset)
+                sample_size = min(sample_size, original_size)
+                if sample_size < original_size:
+                    dataset = dataset.shuffle(seed=seed).select(range(sample_size))
+                    logger.info_rank0(
+                        f"  Sampled {sample_size} samples from {original_size} (requested: {sample_sizes[i]})"
+                    )
+                elif sample_size == original_size:
+                    logger.info_rank0(
+                        f"  Using all {original_size} samples (requested: {sample_sizes[i]})"
+                    )
+            else:
+                logger.info_rank0(f"  Using all {len(dataset)} samples (sample_size=-1)")
+        
+        datasets_dict[f"dataset_{i}"] = dataset
     
     # Merge datasets using the same logic as in loader.py
     datasets_list = list(datasets_dict.values())
@@ -191,7 +277,15 @@ def merge_tokenized_datasets_cli():
         "--seed",
         type=int,
         default=42,
-        help="Random seed for interleave strategy",
+        help="Random seed for interleave strategy and sampling",
+    )
+    parser.add_argument(
+        "--sample_sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Sample sizes for each dataset. -1 means use all data, positive integer means random sample that many. "
+             "Must match the number of dataset paths. If not provided, all datasets are used fully.",
     )
     parser.add_argument(
         "--overwrite",
@@ -213,6 +307,11 @@ def merge_tokenized_datasets_cli():
     print("=" * 60)
     print(f"数据集数量: {len(args.dataset_paths)}")
     print(f"合并策略: {args.mix_strategy}")
+    if args.sample_sizes:
+        print(f"采样数量: {args.sample_sizes}")
+        print("  (-1 表示使用全部数据)")
+    else:
+        print("采样数量: 全部使用")
     print(f"输出路径: {args.output_path}")
     print("=" * 60)
     
@@ -222,6 +321,7 @@ def merge_tokenized_datasets_cli():
         output_path=args.output_path,
         mix_strategy=args.mix_strategy,
         interleave_probs=args.interleave_probs,
+        sample_sizes=args.sample_sizes,
         seed=args.seed,
     )
     

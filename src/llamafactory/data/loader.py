@@ -330,6 +330,11 @@ def _get_preprocessed_dataset(
                 **kwargs,
             )
             
+            # 检查 shard 是否为空
+            if len(shard) == 0:
+                logger.warning_rank0(f"Shard {shard_idx + 1}/{num_shards} (索引 {start_idx}-{end_idx}) 处理后的数据为空，跳过保存。这可能是因为数据预处理时所有数据都被过滤掉了。")
+                continue
+            
             # 立即保存当前 shard
             shard.save_to_disk(shard_path)
             logger.info_rank0(f"Shard {shard_idx + 1}/{num_shards} 已保存到 {shard_path}")

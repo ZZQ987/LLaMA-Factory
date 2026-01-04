@@ -28,6 +28,8 @@ from transformers import DataCollatorForSeq2Seq
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
 from ..extras.packages import is_pillow_available
 
+from .data_utils import convert_2d_to_4d_attention_mask
+
 
 if is_pillow_available():
     from PIL import Image
@@ -256,8 +258,22 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
     block_diag_attn: bool = False
     attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "eager"
     compute_dtype: "torch.dtype" = torch.float32
+    mask_answer_from_first_video: bool = True
+    mask_grounding_from_other_videos: bool = True
     _backup_features: Optional[dict[str, "torch.Tensor"]] = None
     try_backup: bool = False
+    _success_count: int = 0
+
+    def __post_init__(self):
+        """初始化后打印关键参数"""
+        super().__post_init__()  # 调用父类的 __post_init__
+        print(f"[INFO] SFTDataCollatorWith4DAttentionMask initialized with:")
+        print(f"  - block_diag_attn: {self.block_diag_attn}")
+        print(f"  - attn_implementation: {self.attn_implementation}")
+        print(f"  - compute_dtype: {self.compute_dtype}")
+        print(f"  - mask_answer_from_first_video: {self.mask_answer_from_first_video}")
+        print(f"  - mask_grounding_from_other_videos: {self.mask_grounding_from_other_videos}")
+        print(f"  - try_backup: {self.try_backup}")
 
     def get_backup_features(self) -> dict[str, "torch.Tensor"]:
         temp_features = {}
@@ -268,23 +284,123 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
                 temp_features[key] = value
         return temp_features
 
+    def _validate_video_token_match(self, features: dict[str, "torch.Tensor"]) -> bool:
+        r"""Validate that video features and video tokens match.
+        
+        Returns True if match, False otherwise.
+        """
+        # Only check for Qwen models that use video
+        if self.model is None:
+            return True
+        
+        model_type = getattr(self.model.config, "model_type", None)
+        if model_type not in ["qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen2_5_omni_thinker", "qwen3_omni_moe_thinker"]:
+            return True
+        
+        # Check if video_grid_thw exists
+        video_grid_thw = features.get("video_grid_thw")
+        if video_grid_thw is None or len(video_grid_thw) == 0:
+            return True
+        
+        # Get video_pad token id
+        video_token_str = getattr(self.template.mm_plugin, "video_token", None) if self.template else None
+        if video_token_str is None:
+            return True
+        
+        try:
+            video_pad_token_id = self.tokenizer.convert_tokens_to_ids(video_token_str)
+            if video_pad_token_id is None or video_pad_token_id == self.tokenizer.unk_token_id:
+                return True
+        except Exception:
+            return True
+        
+        # Get merge_length for calculating token count
+        if self.processor is None:
+            return True
+        
+        image_processor = getattr(self.processor, "image_processor", None)
+        if image_processor is None:
+            return True
+        
+        merge_size = getattr(image_processor, "merge_size", None)
+        if merge_size is None:
+            return True
+        
+        merge_length = merge_size ** 2
+        
+        # Calculate expected token count from video_grid_thw
+        expected_token_count = 0
+        for grid_thw in video_grid_thw:
+            if torch.is_tensor(grid_thw):
+                expected_token_count += int(grid_thw.prod().item() // merge_length)
+            else:
+                # Handle list format
+                if isinstance(grid_thw, (list, tuple)) and len(grid_thw) >= 3:
+                    expected_token_count += int((grid_thw[0] * grid_thw[1] * grid_thw[2]) // merge_length)
+        
+        # Count actual video_pad tokens in input_ids
+        input_ids = features.get("input_ids")
+        if input_ids is None:
+            return True
+        
+        if torch.is_tensor(input_ids):
+            actual_token_count = int((input_ids == video_pad_token_id).sum().item())
+        else:
+            # Handle list format (shouldn't happen after super().__call__, but just in case)
+            if isinstance(input_ids, (list, tuple)):
+                actual_token_count = sum(1 for row in input_ids for token_id in row if token_id == video_pad_token_id)
+            else:
+                # Try to flatten if it's a numpy array or similar
+                try:
+                    import numpy as np
+                    if isinstance(input_ids, np.ndarray):
+                        actual_token_count = int((input_ids == video_pad_token_id).sum())
+                    else:
+                        return True  # Unknown format, skip check
+                except ImportError:
+                    return True  # Can't process, skip check
+        
+        # print("expected_token_count", expected_token_count)
+        # print("actual_token_count", actual_token_count)
+        # Check if they match
+        if expected_token_count != actual_token_count:
+            print(f"[WARN] Video features and video tokens mismatch detected!")
+            print(f"[WARN] Expected tokens (from video_grid_thw): {expected_token_count}")
+            print(f"[WARN] Actual tokens (from input_ids): {actual_token_count}")
+            print(f"[WARN] Difference: {actual_token_count - expected_token_count}")
+            return False
+        
+        return True
+
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         try:
             processed_features = super().__call__(features)
-            # 如果成功处理，保存为备用 feature（第一个成功处理的完整 batch）
-
-            if self._backup_features is None:
+            
+            # 验证视频特征和 token 是否匹配
+            if not self._validate_video_token_match(processed_features):
+                # 如果检查失败，尝试使用 backup features（如果存在）
+                if self._backup_features is not None:
+                    print(f"[WARN] Video token mismatch detected, using backup features")
+                    processed_features = self.get_backup_features()
+                else:
+                    # 如果没有 backup，记录警告但继续执行（让模型自己处理）
+                    print(f"[WARN] Video token mismatch detected, but no backup available. Continuing anyway...")
+            
+            # 如果成功处理，增加计数器
+            self._success_count += 1
+            
+            # 每成功处理1000次，更新一次backup
+            if self._backup_features is None or self._success_count % 1000 == 0:
                 self._backup_features = {}
                 for k, v in processed_features.items():
                     if torch.is_tensor(v):
                         self._backup_features[k] = v.clone()
                     else:
                         self._backup_features[k] = v
-            # else:
-            #     if self.try_backup == False:
-            #         processed_features = self.get_backup_features()
-            #         print("try to use backup features")
-            #         self.try_backup = True
+                if self._success_count == 0:
+                    print(f"[INFO] First successful batch, initializing backup features")
+                elif self._success_count % 1000 == 0:
+                    print(f"[INFO] Updated backup features after {self._success_count} successful batches")
 
             features = processed_features
         except Exception as e:
@@ -298,8 +414,46 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
                 # 如果没有备用 feature，重新抛出异常
                 raise e
         
+        # # Ensure attention_mask shape matches input_ids
+        # input_ids_shape = features.get("input_ids", None)
+        # if input_ids_shape is not None:
+        #     expected_seq_len = input_ids_shape.shape[1]
+        #     current_mask = features["attention_mask"]
+            
+        #     if current_mask.dim() == 2:
+        #         # Check if sequence length matches
+        #         if current_mask.shape[1] != expected_seq_len:
+        #             print(f"[WARN] attention_mask seq_len ({current_mask.shape[1]}) != input_ids seq_len ({expected_seq_len}), adjusting...")
+        #             # Pad or truncate mask to match input_ids
+        #             if current_mask.shape[1] < expected_seq_len:
+        #                 # Pad with zeros (padding tokens)
+        #                 pad_size = expected_seq_len - current_mask.shape[1]
+        #                 current_mask = torch.cat([
+        #                     current_mask,
+        #                     torch.zeros((current_mask.shape[0], pad_size), dtype=current_mask.dtype, device=current_mask.device)
+        #                 ], dim=1)
+        #             else:
+        #                 # Truncate
+        #                 current_mask = current_mask[:, :expected_seq_len]
+        #             features["attention_mask"] = current_mask
+        
         if self.block_diag_attn and self.attn_implementation != "flash_attention_2":
+            print("prepare_4d_attention_mask")
             features["attention_mask"] = prepare_4d_attention_mask(features["attention_mask"], self.compute_dtype)
+        else:
+            # Convert 2D attention mask to 4D if it's still 2D
+            if features["attention_mask"].dim() == 2:
+                print("Converting 2D attention_mask to 4D")
+                features["attention_mask"] = convert_2d_to_4d_attention_mask(
+                    features["attention_mask"], 
+                    dtype=self.compute_dtype,
+                    input_ids=features.get("input_ids", None),
+                    tokenizer=self.tokenizer if hasattr(self, 'tokenizer') else None,
+                    mask_answer_from_first_video=self.mask_answer_from_first_video,
+                    mask_grounding_from_other_videos=self.mask_grounding_from_other_videos
+                )
+
+        print("shape of attention_mask: ", features["attention_mask"].shape)
 
         for key, value in features.items():  # cast data dtype for paligemma
             if torch.is_tensor(value) and torch.is_floating_point(value):
