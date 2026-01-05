@@ -41,6 +41,14 @@ class BaseModelArguments:
             "help": "Path to the model weight or identifier from huggingface.co/models or modelscope.cn/models."
         },
     )
+    mask_answer_from_first_video: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to mask the answer from the first video."},
+    )
+    mask_grounding_from_other_videos: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to mask the grounding from the other videos."},
+    )
     adapter_name_or_path: Optional[str] = field(
         default=None,
         metadata={

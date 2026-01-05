@@ -1573,6 +1573,7 @@ class Qwen2AudioPlugin(BasePlugin):
 class Qwen2VLPlugin(BasePlugin):
     vision_bos_token: str = "<|vision_start|>"
     vision_eos_token: str = "<|vision_end|>"
+    use_frame_folder_list = ['CGBench', 'longvideodb']
 
     @override
     def _preprocess_image(self, image: "ImageObject", **kwargs) -> "ImageObject":
@@ -1686,20 +1687,27 @@ class Qwen2VLPlugin(BasePlugin):
             kwargs['num_video'] = len(videos)
             frames: list[ImageObject] = []
 
-            if "CGBench" in video and crop_interval is None and idx_video == 0:
-                print("use frame folder to load video for CGBench......")
+            if any(dataset in video for dataset in self.use_frame_folder_list) and crop_interval is None and idx_video == 0:
+                print(f"use frame folder to load video for [{dataset}]......")
                 # 转换路径：从 /mnt/petrelfs/zhangzhiqiu/CGBench/cg_videos_720p/BV15j411t7m6.mp4
                 # 到 /mnt/petrelfs/zhangzhiqiu/videochat-o3/data/CGBench/cg_videos_720p_4fps/BV15j411t7m6
                 video_basename = os.path.splitext(os.path.basename(video))[0]  # 获取不带扩展名的文件名
-                # 构建新的帧文件夹路径
-                video_frame_path = os.path.join(
-                    "/mnt/petrelfs/zhangzhiqiu/videochat-o3/data/CGBench/cg_videos_720p_4fps/",
-                    video_basename
-                )
-                
+                if "CGBench" in video:
+                    video_frame_path = os.path.join(
+                        "/mnt/petrelfs/zhangzhiqiu/videochat-o3/data/CGBench/cg_videos_720p_4fps/",
+                        video_basename
+                    )
+                elif "longvideodb" in video:
+                    video_frame_path = os.path.join(
+                        "/mnt/petrelfs/zhangzhiqiu/videochat-o3/data/LongVideoDB/videos_4fps/",
+                        video_basename
+                    )
+                else:
+                    raise ValueError(f"Unsupported dataset: {video}")
+
                 # 读取文件夹中的所有帧文件并排序
                 if not os.path.exists(video_frame_path):
-                    raise FileNotFoundError(f"[CGBench] Frame folder not found: {video_frame_path}")
+                    raise FileNotFoundError(f"[{dataset}] Frame folder not found: {video_frame_path}")
                 
                 frame_files = []
                 for f in os.listdir(video_frame_path):
@@ -1710,7 +1718,7 @@ class Qwen2VLPlugin(BasePlugin):
                 frame_files = sorted(frame_files)
                 
                 if len(frame_files) == 0:
-                    raise ValueError(f"[CGBench] No frame files found in: {video_frame_path}")
+                    raise ValueError(f"[{dataset}] No frame files found in: {video_frame_path}")
                 
                 total_frames = len(frame_files)
                 avg_fps = 4.0  # 4fps抽帧
@@ -1754,7 +1762,7 @@ class Qwen2VLPlugin(BasePlugin):
                     fps_per_video.append(len(sample_indices) / float(video_stream.duration * video_stream.time_base))
                     durations.append(float(video_stream.duration * video_stream.time_base))
                 
-                assert len(frames) > 0, "[CGBench] sample frames is empty"
+                assert len(frames) > 0, f"[{dataset}] sample frames is empty"
             else:
                 container = None
                 try:
@@ -1856,20 +1864,25 @@ class Qwen2VLPlugin(BasePlugin):
             #     frames = video
             #     fps_per_video.append(kwargs.get("video_fps", 2.0))
             #     durations.append(len(frames) / kwargs.get("video_fps", 2.0))
-            if "CGBench" in video and crop_interval is None and idx_video == 0:
-                print("use frame folder to load video for CGBench......")
-                # 转换路径：从 /mnt/petrelfs/zhangzhiqiu/CGBench/cg_videos_720p/BV15j411t7m6.mp4
-                # 到 /mnt/petrelfs/zhangzhiqiu/videochat-o3/data/CGBench/cg_videos_720p_4fps/BV15j411t7m6
+            if any(dataset in video for dataset in self.use_frame_folder_list) and crop_interval is None and idx_video == 0:
+                print(f"use frame folder to load video for [{dataset}]......")
                 video_basename = os.path.splitext(os.path.basename(video))[0]  # 获取不带扩展名的文件名
-                # 构建新的帧文件夹路径
-                video_frame_path = os.path.join(
-                    "/mnt/petrelfs/zhangzhiqiu/videochat-o3/data/CGBench/cg_videos_720p_4fps/",
-                    video_basename
-                )
+                if "CGBench" in video:
+                    video_frame_path = os.path.join(
+                        "/mnt/petrelfs/zhangzhiqiu/videochat-o3/data/CGBench/cg_videos_720p_4fps/",
+                        video_basename
+                    )
+                elif "longvideodb" in video:
+                    video_frame_path = os.path.join(
+                        "/mnt/petrelfs/zhangzhiqiu/videochat-o3/data/LongVideoDB/videos_4fps/",
+                        video_basename
+                    )
+                else:
+                    raise ValueError(f"Unsupported dataset: {video}")
                 
                 # 读取文件夹中的所有帧文件并排序
                 if not os.path.exists(video_frame_path):
-                    raise FileNotFoundError(f"[CGBench] Frame folder not found: {video_frame_path}")
+                    raise FileNotFoundError(f"[{dataset}] Frame folder not found: {video_frame_path}")
                 
                 frame_files = []
                 for f in os.listdir(video_frame_path):
@@ -1880,7 +1893,7 @@ class Qwen2VLPlugin(BasePlugin):
                 frame_files = sorted(frame_files)
                 
                 if len(frame_files) == 0:
-                    raise ValueError(f"[CGBench] No frame files found in: {video_frame_path}")
+                    raise ValueError(f"[{dataset}] No frame files found in: {video_frame_path}")
                 
                 total_frames = len(frame_files)
                 avg_fps = 4.0  # 4fps抽帧
@@ -1925,7 +1938,7 @@ class Qwen2VLPlugin(BasePlugin):
                     fps_per_video.append(len(sample_indices) / float(video_stream.duration * video_stream.time_base))
                     durations.append(float(video_stream.duration * video_stream.time_base))
                 
-                assert len(frames) > 0, "[CGBench] sample frames is empty"
+                assert len(frames) > 0, f"[{dataset}] sample frames is empty"
             else:
                 vr = None
                 try:

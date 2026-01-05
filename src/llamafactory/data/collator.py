@@ -258,8 +258,8 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
     block_diag_attn: bool = False
     attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "eager"
     compute_dtype: "torch.dtype" = torch.float32
-    mask_answer_from_first_video: bool = True
-    mask_grounding_from_other_videos: bool = True
+    mask_answer_from_first_video: bool = False
+    mask_grounding_from_other_videos: bool = False
     _backup_features: Optional[dict[str, "torch.Tensor"]] = None
     try_backup: bool = False
     _success_count: int = 0
@@ -390,7 +390,7 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
             self._success_count += 1
             
             # 每成功处理1000次，更新一次backup
-            if self._backup_features is None or self._success_count % 1000 == 0:
+            if self._backup_features is None or self._success_count % 100 == 0:
                 self._backup_features = {}
                 for k, v in processed_features.items():
                     if torch.is_tensor(v):
@@ -399,7 +399,7 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
                         self._backup_features[k] = v
                 if self._success_count == 0:
                     print(f"[INFO] First successful batch, initializing backup features")
-                elif self._success_count % 1000 == 0:
+                elif self._success_count % 100 == 0:
                     print(f"[INFO] Updated backup features after {self._success_count} successful batches")
 
             features = processed_features
@@ -438,12 +438,12 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
         #             features["attention_mask"] = current_mask
         
         if self.block_diag_attn and self.attn_implementation != "flash_attention_2":
-            print("prepare_4d_attention_mask")
+            # print("prepare_4d_attention_mask")
             features["attention_mask"] = prepare_4d_attention_mask(features["attention_mask"], self.compute_dtype)
-        else:
+        if self.mask_answer_from_first_video or self.mask_grounding_from_other_videos:
             # Convert 2D attention mask to 4D if it's still 2D
             if features["attention_mask"].dim() == 2:
-                print("Converting 2D attention_mask to 4D")
+                # print("Converting 2D attention_mask to 4D")
                 features["attention_mask"] = convert_2d_to_4d_attention_mask(
                     features["attention_mask"], 
                     dtype=self.compute_dtype,
@@ -452,8 +452,11 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
                     mask_answer_from_first_video=self.mask_answer_from_first_video,
                     mask_grounding_from_other_videos=self.mask_grounding_from_other_videos
                 )
+            else:
+                print(f"[WARN] attention_mask is not 2D, shape: {features['attention_mask'].shape}")
+                raise ValueError(f"attention_mask is not 2D, shape: {features['attention_mask'].shape}")
 
-        print("shape of attention_mask: ", features["attention_mask"].shape)
+        # print("shape of attention_mask: ", features["attention_mask"].shape)
 
         for key, value in features.items():  # cast data dtype for paligemma
             if torch.is_tensor(value) and torch.is_floating_point(value):

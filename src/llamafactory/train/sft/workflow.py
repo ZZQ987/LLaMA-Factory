@@ -75,6 +75,8 @@ def run_sft(
         block_diag_attn=model_args.block_diag_attn,
         attn_implementation=getattr(model.config, "_attn_implementation", None),
         compute_dtype=model_args.compute_dtype,
+        mask_answer_from_first_video=model_args.mask_answer_from_first_video,
+        mask_grounding_from_other_videos=model_args.mask_grounding_from_other_videos,
         **tokenizer_module,
     )
 
